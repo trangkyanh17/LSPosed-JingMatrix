@@ -40,6 +40,7 @@ import androidx.annotation.RequiresApi;
 
 import java.io.File;
 import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -50,9 +51,11 @@ public class Dex2OatService implements Runnable {
     private static final String TAG = "LSPosedDex2Oat";
     private static final String WRAPPER32 = "bin/dex2oat32";
     private static final String WRAPPER64 = "bin/dex2oat64";
+    private static final String HOOKER32 = "bin/liboat_hook32.so";
+    private static final String HOOKER64 = "bin/liboat_hook64.so";
 
-    private final String[] dex2oatArray = new String[4];
-    private final FileDescriptor[] fdArray = new FileDescriptor[4];
+    private final String[] dex2oatArray = new String[6];
+    private final FileDescriptor[] fdArray = new FileDescriptor[6];
     private final FileObserver selinuxObserver;
     private int compatibility = DEX2OAT_OK;
 
@@ -65,16 +68,78 @@ public class Dex2OatService implements Runnable {
         }
     }
 
+    /**
+     * Checks the ELF header of the target file.
+     * If 32-bit -> Assigns to Index 0 (Release) or 1 (Debug).
+     * If 64-bit -> Assigns to Index 2 (Release) or 3 (Debug).
+     */
+    private void checkAndAddDex2Oat(String path) {
+        if (path == null)
+            return;
+        File file = new File(path);
+        if (!file.exists())
+            return;
+
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] header = new byte[5];
+            if (fis.read(header) != 5)
+                return;
+
+            // 1. Verify ELF Magic: 0x7F 'E' 'L' 'F'
+            if (header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F') {
+                return;
+            }
+
+            // 2. Check Architecture (header[4]): 1 = 32-bit, 2 = 64-bit
+            boolean is32Bit = (header[4] == 1);
+            boolean is64Bit = (header[4] == 2);
+            boolean isDebug = path.contains("dex2oatd");
+
+            int index = -1;
+
+            if (is32Bit) {
+                index = isDebug ? 1 : 0; // Index 0/1 maps to r32/d32 in C++
+            } else if (is64Bit) {
+                index = isDebug ? 3 : 2; // Index 2/3 maps to r64/d64 in C++
+            }
+
+            // 3. Assign to the detected slot
+            if (index != -1 && dex2oatArray[index] == null) {
+                dex2oatArray[index] = path;
+                try {
+                    // Open the FD for the wrapper to use later
+                    fdArray[index] = Os.open(path, OsConstants.O_RDONLY, 0);
+                    Log.i(TAG, "Detected " + path + " as " + (is64Bit ? "64-bit" : "32-bit") + " -> Assigned Index "
+                            + index);
+                } catch (ErrnoException e) {
+                    Log.e(TAG, "Failed to open FD for " + path, e);
+                    dex2oatArray[index] = null;
+                }
+            }
+        } catch (IOException e) {
+            // File not readable, skip
+        }
+    }
+
     public Dex2OatService() {
         if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
-            openDex2oat(Process.is64Bit() ? 2 : 0, "/apex/com.android.runtime/bin/dex2oat");
-            openDex2oat(Process.is64Bit() ? 3 : 1, "/apex/com.android.runtime/bin/dex2oatd");
+            // Android 10: Check the standard path.
+            // Logic will detect if it is 32-bit and put it in Index 0.
+            checkAndAddDex2Oat("/apex/com.android.runtime/bin/dex2oat");
+            checkAndAddDex2Oat("/apex/com.android.runtime/bin/dex2oatd");
+
+            // Check for explicit 64-bit paths (just in case)
+            checkAndAddDex2Oat("/apex/com.android.runtime/bin/dex2oat64");
+            checkAndAddDex2Oat("/apex/com.android.runtime/bin/dex2oatd64");
         } else {
-            openDex2oat(0, "/apex/com.android.art/bin/dex2oat32");
-            openDex2oat(1, "/apex/com.android.art/bin/dex2oatd32");
-            openDex2oat(2, "/apex/com.android.art/bin/dex2oat64");
-            openDex2oat(3, "/apex/com.android.art/bin/dex2oatd64");
+            checkAndAddDex2Oat("/apex/com.android.art/bin/dex2oat32");
+            checkAndAddDex2Oat("/apex/com.android.art/bin/dex2oatd32");
+            checkAndAddDex2Oat("/apex/com.android.art/bin/dex2oat64");
+            checkAndAddDex2Oat("/apex/com.android.art/bin/dex2oatd64");
         }
+
+        openDex2oat(4, "/data/adb/modules/zygisk_lsposed/bin/liboat_hook32.so");
+        openDex2oat(5, "/data/adb/modules/zygisk_lsposed/bin/liboat_hook64.so");
 
         var enforce = Paths.get("/sys/fs/selinux/enforce");
         var policy = Paths.get("/sys/fs/selinux/policy");
@@ -126,7 +191,7 @@ public class Dex2OatService implements Runnable {
     }
 
     private boolean notMounted() {
-        for (int i = 0; i < dex2oatArray.length; i++) {
+        for (int i = 0; i < dex2oatArray.length && i < 4; i++) {
             var bin = dex2oatArray[i];
             if (bin == null) continue;
             try {
@@ -171,7 +236,7 @@ public class Dex2OatService implements Runnable {
         Log.i(TAG, "Dex2oat wrapper daemon start");
         var sockPath = getSockPath();
         Log.d(TAG, "wrapper path: " + sockPath);
-        var magisk_file = "u:object_r:magisk_file:s0";
+        var xposed_file = "u:object_r:xposed_file:s0";
         var dex2oat_exec = "u:object_r:dex2oat_exec:s0";
         if (SELinux.checkSELinuxAccess("u:r:dex2oat:s0", dex2oat_exec,
                 "file", "execute_no_trans")) {
@@ -179,10 +244,12 @@ public class Dex2OatService implements Runnable {
             SELinux.setFileContext(WRAPPER64, dex2oat_exec);
             setSockCreateContext("u:r:dex2oat:s0");
         } else {
-            SELinux.setFileContext(WRAPPER32, magisk_file);
-            SELinux.setFileContext(WRAPPER64, magisk_file);
+            SELinux.setFileContext(WRAPPER32, xposed_file);
+            SELinux.setFileContext(WRAPPER64, xposed_file);
             setSockCreateContext("u:r:installd:s0");
         }
+        SELinux.setFileContext(HOOKER32, xposed_file);
+        SELinux.setFileContext(HOOKER64, xposed_file);
         try (var server = new LocalServerSocket(sockPath)) {
             setSockCreateContext(null);
             while (true) {
@@ -193,8 +260,7 @@ public class Dex2OatService implements Runnable {
                     var fd = new FileDescriptor[]{fdArray[id]};
                     client.setFileDescriptorsForSend(fd);
                     os.write(1);
-                    Log.d(TAG, "Sent stock fd: is64 = " + ((id & 0b10) != 0) +
-                            ", isDebug = " + ((id & 0b01) != 0));
+                    Log.d(TAG, "Sent fd of " + dex2oatArray[id]);
                 }
             }
         } catch (IOException e) {

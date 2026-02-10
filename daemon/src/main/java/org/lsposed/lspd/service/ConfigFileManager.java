@@ -70,6 +70,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.stream.Stream;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -192,9 +193,18 @@ public class ConfigFileManager {
     public static boolean chattr0(Path path) {
         try {
             var dir = Os.open(path.toString(), OsConstants.O_RDONLY, 0);
+            // Clear all special file attributes on the directory
             HiddenApiBridge.Os_ioctlInt(dir, Process.is64Bit() ? 0x40086602 : 0x40046602, 0);
             Os.close(dir);
             return true;
+        } catch (ErrnoException e) {
+            // If the operation is not supported (ENOTSUP), it means the filesystem doesn't support attributes.
+            // We can assume the file is not immutable and proceed.
+            if (e.errno == OsConstants.ENOTSUP) {
+                return true;
+            }
+            Log.d(TAG, "chattr 0", e);
+            return false;
         } catch (Throwable e) {
             Log.d(TAG, "chattr 0", e);
             return false;
@@ -454,18 +464,36 @@ public class ConfigFileManager {
 
     static Path resolveModuleDir(String packageName, String dir, int userId, int uid) throws IOException {
         var path = modulePath.resolve(String.valueOf(userId)).resolve(packageName).resolve(dir).normalize();
-        if (uid != -1) {
-            if (path.toFile().mkdirs()) {
-                try {
-                    SELinux.setFileContext(path.toString(), "u:object_r:magisk_file:s0");
-                    Os.chown(path.toString(), uid, uid);
-                    Os.chmod(path.toString(), 0755);
-                } catch (ErrnoException e) {
-                    throw new IOException(e);
-                }
+        // Ensure the directory and any necessary parent directories exist.
+        path.toFile().mkdirs();
+
+        if (SELinux.getFileContext(path.toString()) != "u:object_r:xposed_data:s0") {
+            // SELinux label could be reset after a reboot.
+            try {
+                setSelinuxContextRecursive(path, "u:object_r:xposed_data:s0");
+                Os.chown(path.toString(), uid, uid);
+                Os.chmod(path.toString(), 0755);
+            } catch (ErrnoException e) {
+                throw new IOException(e);
             }
         }
         return path;
+    }
+
+     private static void setSelinuxContextRecursive(Path path, String context) throws IOException {
+        try {
+            SELinux.setFileContext(path.toString(), context);
+
+            if (Files.isDirectory(path)) {
+                try (Stream<Path> stream = Files.list(path)) {
+                    for (Path entry : (Iterable<Path>) stream::iterator) {
+                        setSelinuxContextRecursive(entry, context);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new IOException("Failed to recursively set SELinux context for " + path, e);
+        }
     }
 
     private static class FileLocker {

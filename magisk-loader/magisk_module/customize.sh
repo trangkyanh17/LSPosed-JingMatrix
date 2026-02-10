@@ -73,7 +73,6 @@ ui_print "- Extracting module files"
 
 extract "$ZIPFILE" 'module.prop'        "$MODPATH"
 extract "$ZIPFILE" 'action.sh'          "$MODPATH"
-extract "$ZIPFILE" 'post-fs-data.sh'    "$MODPATH"
 extract "$ZIPFILE" 'service.sh'         "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'       "$MODPATH"
 extract "$ZIPFILE" 'sepolicy.rule'      "$MODPATH"
@@ -84,16 +83,6 @@ rm -f /data/adb/lspd/manager.apk
 extract "$ZIPFILE" 'manager.apk'        "$MODPATH"
 
 if [ "$FLAVOR" == "zygisk" ]; then
-  # extract for KernelSU and APatch
-  if [ "$KSU" ] || [ "$APATCH" ]; then
-    # webroot only for zygisk
-    mkdir -p "$MODPATH/webroot"
-    extract "$ZIPFILE" "webroot/index.html" "$MODPATH/webroot" true
-    # evaluate if use awk or tr -s ' ' | cut -d' ' -f5
-    SRCJS=$(unzip -l "$ZIPFILE" | grep "webroot/src" | grep -v sha256 | awk '{print $4}')
-    extract "$ZIPFILE" "$SRCJS" "$MODPATH/webroot" true
-  fi
-
   mkdir -p "$MODPATH/zygisk"
 
   if [ "$ARCH" = "arm" ] || [ "$ARCH" = "arm64" ]; then
@@ -123,19 +112,27 @@ if [ "$API" -ge 29 ]; then
 
   if [ "$ARCH" = "arm" ] || [ "$ARCH" = "arm64" ]; then
     extract "$ZIPFILE" "bin/armeabi-v7a/dex2oat" "$MODPATH/bin" true
+    extract "$ZIPFILE" "bin/armeabi-v7a/liboat_hook.so" "$MODPATH/bin" true
     mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat32"
+    mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook32.so"
 
     if [ "$IS64BIT" = true ]; then
       extract "$ZIPFILE" "bin/arm64-v8a/dex2oat" "$MODPATH/bin" true
+      extract "$ZIPFILE" "bin/arm64-v8a/liboat_hook.so" "$MODPATH/bin" true
       mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat64"
+      mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook64.so"
     fi
   elif [ "$ARCH" == "x86" ] || [ "$ARCH" == "x64" ]; then
     extract "$ZIPFILE" "bin/x86/dex2oat" "$MODPATH/bin" true
+    extract "$ZIPFILE" "bin/x86/liboat_hook.so" "$MODPATH/bin" true
     mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat32"
+    mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook32.so"
 
     if [ "$IS64BIT" = true ]; then
       extract "$ZIPFILE" "bin/x86_64/dex2oat" "$MODPATH/bin" true
+      extract "$ZIPFILE" "bin/x86_64/liboat_hook.so" "$MODPATH/bin" true
       mv "$MODPATH/bin/dex2oat" "$MODPATH/bin/dex2oat64"
+      mv "$MODPATH/bin/liboat_hook.so" "$MODPATH/bin/liboat_hook64.so"
     fi
   fi
 
@@ -149,7 +146,7 @@ else
 fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/bin" 0 2000 0755 0755 u:object_r:magisk_file:s0
+set_perm_recursive "$MODPATH/bin" 0 2000 0755 0755 u:object_r:xposed_file:s0
 chmod 0744 "$MODPATH/daemon"
 
 if [ "$(grep_prop ro.maple.enable)" == "1" ] && [ "$FLAVOR" == "zygisk" ]; then
